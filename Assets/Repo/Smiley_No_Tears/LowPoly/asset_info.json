@@ -1,0 +1,11 @@
+{
+  "name": "smiley_no_tears",
+  "source": "User supplied reference image; latest instruction: no tears",
+  "method": "Local procedural Blender modeling",
+  "parts": 34,
+  "formats": [
+    "blend",
+    "glb"
+  ],
+  "license": "User supplied reference; underlying reference rights not assessed"
+}

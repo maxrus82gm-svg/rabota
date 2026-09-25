@@ -1,0 +1,401 @@
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+$OutputDirName = "GigaCodexBridge_Home_Setup_v1.0"
+$OutputDir = Join-Path $PSScriptRoot $OutputDirName
+
+if (Test-Path $OutputDir) {
+    Get-ChildItem -Path $OutputDir -File | Remove-Item -Force
+} else {
+    New-Item -ItemType Directory -Path $OutputDir | Out-Null
+}
+
+@'
+@echo off
+chcp 65001 >nul
+setlocal EnableExtensions
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0install.ps1"
+if errorlevel 1 (
+    echo.
+    echo INSTALLATION FAILED
+    exit /b 1
+) else (
+    echo.
+    echo INSTALLATION SUCCESSFUL
+)
+endlocal
+pause
+'@ | Set-Content -LiteralPath (Join-Path $OutputDir "install.bat") -Encoding UTF8
+
+@'
+<#
+.SYNOPSIS
+Установщик GigaCodexBridge Home Setup v1.0
+#>
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+function Write-Log($Message) {
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "[$ts] $Message"
+    Write-Host $line
+    if ($script:LogPath) {
+        Add-Content -LiteralPath $script:LogPath -Value $line -Encoding UTF8
+    }
+}
+
+try {
+    $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+    $TargetDir = Join-Path $env:LOCALAPPDATA "GigaCodexBridge"
+    $LogsDir = Join-Path $TargetDir "logs"
+    $null = New-Item -ItemType Directory -Path $TargetDir -Force
+    $null = New-Item -ItemType Directory -Path $LogsDir -Force
+    $script:LogPath = Join-Path $LogsDir ("install_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+    Write-Log "=== Install started ==="
+    Write-Log "Target dir: $TargetDir"
+
+    function Find-Python312() {
+        $candidates = @()
+        try { $ver = & py -3.12 -V 2>&1; if ($LASTEXITCODE -eq 0) { $candidates += ,@("py -3.12", (& py -3.12 -c "import sys; print(sys.executable)" 2>$null).Trim()) } } catch {}
+        try { $path = "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe"; if (Test-Path $path) { $candidates += ,@($path, $path) } } catch {}
+        foreach ($c in $candidates) {
+            $exe = $c[1]
+            if (-not $exe) { continue }
+            if (Test-Path $exe) {
+                return $exe
+            }
+        }
+        return $null
+    }
+
+    $PythonExe = Find-Python312
+    if (-not $PythonExe) {
+        Write-Log "Python 3.12 not found. Checking for winget."
+        try { & winget --version >$null 2>&1; $hasWinget=$true } catch { $hasWinget=$false }
+        if ($hasWinget) {
+            Write-Log "Installing Python 3.12 via winget..."
+            & winget install -e --id Python.Python.3.12 --accept-source-agreements --accept-package-agreements
+            Start-Sleep -Seconds 5
+            $PythonExe = Find-Python312
+        }
+    }
+    if (-not $PythonExe) {
+        Write-Log "ERROR: Python 3.12 not found and cannot be installed automatically."
+        exit 1
+    }
+    Write-Log "Using Python: $PythonExe"
+
+    Copy-Item -LiteralPath (Join-Path $ScriptDir "server.py") -Destination (Join-Path $TargetDir "server.py") -Force
+
+    $VenvDir = Join-Path $TargetDir ".venv"
+    if (-not (Test-Path (Join-Path $VenvDir "Scripts\python.exe"))) {
+        Write-Log "Creating virtual environment at $VenvDir"
+        & $PythonExe -m venv $VenvDir
+    }
+    $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
+    Write-Log "Upgrading pip"
+    & $VenvPython -m pip install --upgrade pip
+    Write-Log "Installing dependencies"
+    & $VenvPython -m pip install "mcp[cli]" httpx certifi
+
+    $certUrl = "https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt"
+    $caCertDest = Join-Path $TargetDir "russian_trusted_root_ca_pem.crt"
+    try {
+        Invoke-WebRequest -Uri $certUrl -OutFile $caCertDest -UseBasicParsing
+    } catch {
+        Write-Log "Invoke-WebRequest failed, trying curl fallback"
+        & curl.exe -k -L -o $caCertDest $certUrl
+    }
+
+    $bundlePath = & $VenvPython -m certifi
+    $needAppend = $true
+    if (Test-Path $caCertDest) {
+        $nuText = Get-Content -Raw -LiteralPath $caCertDest
+        $existing = Get-Content -Raw -LiteralPath $bundlePath
+        if ($existing.Contains($nuText)) {
+            $needAppend = $false
+        }
+    }
+    if ($needAppend) {
+        Write-Log "Appending Russian CA to certifi bundle"
+        "" | Add-Content -LiteralPath $bundlePath -Encoding UTF8
+        Get-Content -LiteralPath $caCertDest | Add-Content -LiteralPath $bundlePath -Encoding UTF8
+    }
+
+    do {
+        $keyAsSecure = Read-Host -Prompt "Введите Authorization Key для GigaChat (ввод скрыт)" -AsSecureString
+        $ptr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($keyAsSecure)
+        $plainKey = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
+        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
+        if ([string]::IsNullOrWhiteSpace($plainKey)) {
+            Write-Host "Ключ не может быть пустым." -ForegroundColor Yellow
+            continue
+        }
+        break
+    } while ($true)
+
+    [System.Environment]::SetEnvironmentVariable("GIGACHAT_CREDENTIALS", $plainKey, "User")
+    [System.Environment]::SetEnvironmentVariable("GIGACHAT_SCOPE", "GIGACHAT_API_PERS", "User")
+    $env:GIGACHAT_CREDENTIALS = $plainKey
+    $env:GIGACHAT_SCOPE = "GIGACHAT_API_PERS"
+
+    Write-Log "Compiling server.py"
+    & $VenvPython -m py_compile (Join-Path $TargetDir "server.py")
+
+    Write-Log "Running OAuth test"
+    try {
+        $oauthResp = & $VenvPython -c "
+import asyncio, os, uuid, httpx
+async def run():
+    credentials = os.environ.get('GIGACHAT_CREDENTIALS')
+    scope = os.environ.get('GIGACHAT_SCOPE','GIGACHAT_API_PERS')
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.post(
+            'https://ngw.devices.sberbank.ru:9443/api/v2/oauth',
+            headers={'Authorization': f'Basic '+credentials, 'RqUID': str(uuid.uuid4()), 'Accept':'application/json'},
+            data={'scope': scope},
+        )
+        r.raise_for_status()
+        j = r.json()
+        t = j.get('access_token')
+        if not t:
+            raise SystemExit(1)
+asyncio.run(run())
+" 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "OAuth failed" }
+        Write-Log "OAuth OK"
+    } catch {
+        Write-Log "OAuth FAILED: $_"
+        exit 1
+    }
+
+    Write-Log "Running Chat API test"
+    try {
+        $chatResp = & $VenvPython -c "
+import asyncio, os, httpx
+async def run():
+    token = None
+    import json,sys,base64,time,uuid
+    import asyncio,os,httpx
+    async def get_access_token():
+        credentials = os.environ.get('GIGACHAT_CREDENTIALS')
+        scope = os.environ.get('GIGACHAT_SCOPE','GIGACHAT_API_PERS')
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
+                'https://ngw.devices.sberbank.ru:9443/api/v2/oauth',
+                headers={'Authorization': f'Basic '+credentials, 'RqUID': str(uuid.uuid4()), 'Accept':'application/json'},
+                data={'scope': scope},
+            )
+            r.raise_for_status()
+            d = r.json()
+            return d.get('access_token')
+    token = await get_access_token()
+    async with httpx.AsyncClient(timeout=180.0) as client:
+        r = await client.post(
+            'https://api.giga.chat/v1/chat/completions',
+            headers={'Authorization': f'Bearer '+token, 'Accept':'application/json'},
+            json={'model':'GigaChat-3-Ultra','messages':[{'role':'user','content':'Ответь строго одной строкой: OK'}],'temperature':0.15,'max_tokens':4096,'stream':False},
+        )
+        r.raise_for_status()
+        d = r.json()
+        msg = d['choices'][0]['message']['content']
+        print(msg)
+asyncio.run(run())
+" 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "Chat API call failed" }
+        $outLine = ($chatResp -split "`r?`n" | Select-Object -Last 1).Trim()
+        if ([string]::IsNullOrWhiteSpace($outLine)) { throw "Empty response" }
+        Write-Log "Chat API returned: $outLine"
+    } catch {
+        Write-Log "Chat API FAILED: $_"
+        exit 1
+    }
+
+    Write-Log "MCP IN-PROCESS self-test"
+    $inprocPy = Join-Path $LogsDir "mcp_inproc_test.py"
+    @'
+import asyncio
+from mcp import Client
+from server import mcp
+
+async def main():
+    async with Client(mcp) as client:
+        tools = await client.list_tools()
+        names = sorted([t.name for t in tools])
+        print("|".join(names))
+
+if __name__ == "__main__":
+    asyncio.run(main())
+'@ | Set-Content -LiteralPath $inprocPy -Encoding UTF8
+    $inprocOut = & $VenvPython $inprocPy 2>&1
+    if ($LASTEXITCODE -ne 0) { Write-Log "IN-PROC MCP TEST FAILED: $inprocOut"; exit 1 }
+    $namesInproc = $inprocOut.Trim().Split('|')
+    $required = @("gigachat_ask","gigachat_file_task")
+    foreach ($r in $required) { if ($namesInproc -notcontains $r) { Write-Log "Missing tool in-proc: $r"; exit 1 } }
+    Write-Log "IN-PROC MCP OK: $($namesInproc -join ', ')"
+    Remove-Item $inprocPy -Force
+
+    Write-Log "MCP STDIO self-test"
+    $stdioPy = Join-Path $LogsDir "mcp_stdio_test.py"
+    @'
+import asyncio
+from mcp import Client, StdioServerParameters
+import os
+
+async def main():
+    params = StdioServerParameters(
+        command=r"{0}",
+        args=["-u", r"{1}"],
+        env={{
+            "GIGACHAT_CREDENTIALS": os.environ["GIGACHAT_CREDENTIALS"],
+            "GIGACHAT_SCOPE": os.environ.get("GIGACHAT_SCOPE","GIGACHAT_API_PERS"),
+        }},
+    )
+    async with Client(params) as client:
+        tools = await client.list_tools()
+        names = sorted([t.name for t in tools])
+        print("|".join(names))
+
+if __name__ == "__main__":
+    asyncio.run(main())
+"@ -f ($VenvPython -replace '\\','\\'), ((Join-Path $TargetDir "server.py") -replace '\\','\\') | Set-Content -LiteralPath $stdioPy -Encoding UTF8
+    $stdioOut = & $VenvPython $stdioPy 2>&1
+    if ($LASTEXITCODE -ne 0) { Write-Log "STDIO MCP TEST FAILED: $stdioOut"; exit 1 }
+    $namesStdio = $stdioOut.Trim().Split('|')
+    foreach ($r in $required) { if ($namesStdio -notcontains $r) { Write-Log "Missing tool stdio: $r"; exit 1 } }
+    Write-Log "STDIO MCP OK: $($namesStdio -join ', ')"
+    Remove-Item $stdioPy -Force
+
+    $configDir = Join-Path $env:USERPROFILE ".codex"
+    $configPath = Join-Path $configDir "config.toml"
+    if (-not (Test-Path $configDir)) { New-Item -ItemType Directory -Path $configDir | Out-Null }
+    $newSection = "[mcp_servers.gigachat_ultra]`ncommand = '{0}'`nargs = ['-u', '{1}']`ncwd = '{2}'`nenabled = true`nenv_vars = ['GIGACHAT_CREDENTIALS','GIGACHAT_SCOPE']`nstartup_timeout_sec = 30`ntool_timeout_sec = 180" -f ($VenvPython -replace "'","''"), ((Join-Path $TargetDir "server.py") -replace "'","''"), ($TargetDir -replace "'","''")
+    if (Test-Path $configPath) {
+        $backupPath = $configPath + ".bak.{0:yyyyMMdd_HHmmss}" -f (Get-Date)
+        Copy-Item -LiteralPath $configPath -Destination $backupPath -Force
+        Write-Log "Backup config: $backupPath"
+        $text = Get-Content -Raw -LiteralPath $configPath
+        $pattern = '\[mcp_servers\.gigachat_ultra\][^\[]*'
+        if ($text -match $pattern) {
+            $text = $text -replace $pattern,$newSection
+        } else {
+            $text = $text.TrimEnd() + "`n`n" + $newSection
+        }
+        Set-Content -LiteralPath $configPath -Value $text -Encoding UTF8
+    } else {
+        Set-Content -LiteralPath $configPath -Value $newSection -Encoding UTF8
+    }
+
+    Write-Log "INSTALLATION SUCCESSFUL"
+    Write-Host ""
+    Write-Host "Готово. Полностью закройте Codex и откройте заново." -ForegroundColor Green
+    exit 0
+} catch {
+    Write-Log "FAILED: $_"
+    exit 1
+}
+'@ | Set-Content -LiteralPath (Join-Path $OutputDir "install.ps1") -Encoding UTF8
+
+@'
+import os
+import time
+import uuid
+from pathlib import Path
+
+import httpx
+from mcp.server.mcpserver import MCPServer
+
+
+mcp = MCPServer("GigaChat Ultra Subagent")
+
+OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+CHAT_URL = "https://api.giga.chat/v1/chat/completions"
+
+MODEL = "GigaChat-3-Ultra"
+TEMPERATURE = 0.15
+MAX_TOKENS = 4096
+
+MAX_TASK_FILE_BYTES = 2 * 1024 * 1024
+ALLOWED_TEXT_SUFFIXES = {".md", ".txt"}
+
+_access_token: str | None = None
+_access_token_valid_until = 0.0
+
+
+async def get_access_token() -> str:
+    global _access_token, _access_token_valid_until
+
+    if _access_token and time.time() < _access_token_valid_until:
+        return _access_token
+
+    credentials = os.getenv("GIGACHAT_CREDENTIALS")
+    scope = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
+
+    if not credentials:
+        raise RuntimeError(
+            "Не найдена переменная среды GIGACHAT_CREDENTIALS."
+        )
+
+    headers = {
+        "Authorization": f"Basic {credentials}",
+        "RqUID": str(uuid.uuid4()),
+        "Accept": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            OAUTH_URL,
+            headers=headers,
+            data={"scope": scope},
+        )
+        response.raise_for_status()
+
+    data = response.json()
+    token = data.get("access_token")
+
+    if not token:
+        raise RuntimeError(
+            f"GigaChat не вернул access_token: {data}"
+        )
+
+    _access_token = token
+    _access_token_valid_until = time.time() + 25 * 60
+    return token
+
+
+async def ask_gigachat(prompt: str) -> str:
+    token = await get_access_token()
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+
+    body = {
+        "model": MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        "temperature": TEMPERATURE,
+        "max_tokens": MAX_TOKENS,
+        "stream": False,
+    }
+
+    async with httpx.AsyncClient(timeout=180.0) as client:
+        response = await client.post(
+            CHAT_URL,
+            headers=headers,
+            json=body,
+        )
+        response.raise_for_status()
+
+    data = response.json()
+
+    try:
+        return data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(
+            "Неожидан
